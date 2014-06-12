@@ -69,7 +69,9 @@ uses
 {$IFDEF Windows}
   Windows, MMSystem,
 {$ELSE}
-  unix, unixutil, baseunix,
+    unix,
+    unixutil,
+   baseunix ,
 {$ENDIF}
   Classes, SysUtils, dateutils;
 
@@ -307,6 +309,9 @@ implementation
   absolute accuracy isn't important.
 }
 
+uses EpikTimerBase;
+
+
 const
   NanoPerSec = 1000000000;
   NanoPerMilli = 1000000;
@@ -322,50 +327,6 @@ const
       http://www.sandpile.org/ia32/msr.htm
 }
 
-// Pentium specific... push and pop the flags and check for CPUID availability
-function HasHardwareCapabilityData: Boolean;
-begin
-  asm
-   PUSHFD
-   POP    EAX
-   MOV    EDX,EAX
-   XOR    EAX,$200000
-   PUSH   EAX
-   POPFD
-   PUSHFD
-   POP    EAX
-   XOR    EAX,EDX
-   JZ     @EXIT
-   MOV    AL,TRUE
-   @EXIT:
-  end;
-end;
-
-function HasHardwareTickCounter: Boolean;
-  var FeatureFlags: Longword;
-  begin
-    FeatureFlags:=0;
-    asm
-      PUSH   EBX
-      XOR    EAX,EAX
-      DW     $A20F
-      POP    EBX
-      CMP    EAX,1
-      JL     @EXIT
-      XOR    EAX,EAX
-      MOV    EAX,1
-      PUSH   EBX
-      DW     $A20F
-      MOV    FEATUREFLAGS,EDX
-      POP    EBX
-      @EXIT:
-    end;
-    Result := (FeatureFlags and $10) <> 0;
-  end;
-
-// Execute the Pentium's RDTSC instruction to access the counter value.
-function HardwareTicks: TickType; assembler; asm DW 0310FH end;
-
 (* * * * * * * * End of i386 Hardware specific code  * * * * * * *)
 
 
@@ -379,7 +340,6 @@ function HasHardwareTickCounter: Boolean; begin Result:=false end;
 function HardwareTicks:TickType; begin result:=0 end;
 {$ENDIF}
 
-function NullHardwareTicks:TickType; begin Result:=0 end;
 
 // Return microsecond normalized time source for a given platform.
 // This should be sync'able to an external time standard (via NTP, for example).
@@ -391,29 +351,8 @@ begin
   {$IFDEF LINUX}
   const
     CLOCK_MONOTONIC = 1;
-
-          { Experimental, no idea if this works or is implemented correctly }
-          function newGetTickCount: Cardinal;
-          var
-            ts: TTimeSpec;
-            i: TickType;
-            t: timeval;
-          begin
-            // use the Posix clock_gettime() call
-            if clock_gettime(CLOCK_MONOTONIC, @ts)=0 then
-            begin
-              // Use the FPC fallback
-              fpgettimeofday(@t,nil);
-              // Build a 64 bit microsecond tick from the seconds and microsecond longints
-              Result := (TickType(t.tv_sec) * NanoPerMilli) + t.tv_usec;
-              Exit;
-            end;
-            i := ts.tv_sec;
-            i := (i*MilliPerSec) + ts.tv_nsec div NanoPerMilli;
-            Result := i;
-          end;
   begin
-    Result := newGetTickCount;
+    Result := GetTicks;
   {$ELSE}
   var
     t: timeval;
@@ -428,8 +367,7 @@ end;
 
 function TEpikTimer.SystemSleep(Milliseconds: Integer): integer;
 begin
-  Sleep(Milliseconds);
-  Result := 0;
+  Result := EpikTimerBase.SystemSleep(Milliseconds);
 end;
 
 function TEpikTimer.GetHardwareTicks: TickType;
@@ -594,28 +532,8 @@ function  TEpikTimer.ElapsedDHMS: String; begin Result:=ElapsedDHMS(BuiltInTimer
 // is measured in "ticks"... which are different periods for each timebase.
 
 function TEpikTimer.CalibrateCallOverheads(var TimeBase: TimebaseData): Integer;
-var i:Integer; St,Fin,Total:TickType;
 begin
-  with Timebase, Timebase.CalibrationParms do
-  begin
-    Total:=0; Result:=1;
-    for I:=1 to TicksIterations do // First get the base tick getting overhead
-      begin
-        St:=Ticks(); Fin:=Ticks();
-        Total:=Total+(Fin-St); // dump the first sample
-      end;
-    TicksOverhead:=Total div TicksIterations;
-    Total:=0;
-    For I:=1 to SleepIterations do
-    Begin
-      St:=Ticks();
-      if SystemSleep(0)<>0 then exit;
-      Fin:=Ticks();
-      Total:=Total+((Fin-St)-TicksOverhead);
-    End;
-    SleepOverhead:=Total div SleepIterations;
-    OverheadCalibrated:=True; Result:=0
-  End
+  Result := EpikTimerBase.CalibrateCallOverheads(TimeBase);
 end;
 
 // CalibrateTickFrequency is a fallback in case a microsecond resolution system
@@ -629,48 +547,18 @@ end;
 // in a nanosleep call so an attempt is made to compensate for some of it here.
 
 function TEpikTimer.CalibrateTickFrequency(var TimeBase: TimebaseData): Integer;
-var
-  i: Integer;
-  Total, SS, SE: TickType;
-  ElapsedTicks, SampleTime: Extended;
 begin
-  With Timebase, Timebase.CalibrationParms do
-  Begin
-    Result:=1; //maintain unitialized default in case something goes wrong.
-    Total:=0;
-    For i:=1 to FreqIterations do
-      begin
-        SS:=Ticks();
-        SystemSleep(FrequencyGateTimeMS);
-        SE:=Ticks();
-        Total:=Total+((SE-SS)-(SleepOverhead+TicksOverhead))
-      End;
-    //doing the floating point conversion allows SampleTime parms of < 1 second
-    ElapsedTicks:=Total div FreqIterations;
-    SampleTime:=FrequencyGateTimeMS;
-
-    TicksFrequency:=Trunc( ElapsedTicks / (SampleTime / MilliPerSec));
-
-    FreqCalibrated:=True;
-  end;
+  Result := EpikTimerBase.CalibrateTickFrequency(TimeBase);
 end;
+
 
 // Grab a snapshot of the system and hardware tick sources... as quickly as
 // possible and with overhead compensation. These samples will be used to
 // correct the accuracy of the hardware tick frequency source when precision
 // long term measurements are desired.
 procedure TEpikTimer.GetCorrelationSample(var CorrelationData: TimeBaseCorrelationData);
-Var
-  TicksHW, TicksSys: TickType;
-  THW, TSYS: TickCallFunc;
 begin
-  THW:=FHWTicks.Ticks; TSYS:=FSystemTicks.Ticks;
-  TicksHW:=THW(); TicksSys:=TSYS();
-  With CorrelationData do
-    Begin
-      SystemTicks:= TicksSys-FSystemTicks.TicksOverhead;
-      HWTicks:=TicksHW-FHWTicks.TicksOverhead;
-    End
+  EpikTimerBase.GetCorrelationSample(CorrelationData);
 end;
 
 (* * * * * * * * * * Timebase correlation section  * * * * * * * * * *)
@@ -681,104 +569,32 @@ end;
   accurate frequency measurement of the typically picosecond time stamp counter. }
 
 function TEpikTimer.GetTimebaseCorrelation: TickType;
-Var
-  HWDiff, SysDiff, Corrected: Extended;
 begin
-  If HWtickSupportAvailable then
-    Begin
-      GetCorrelationSample(UpdatedCorrelationSample);
-      HWDiff:=UpdatedCorrelationSample.HWTicks-StartupCorrelationSample.HWTicks;
-      SysDiff:=UpdatedCorrelationSample.SystemTicks-StartupCorrelationSample.SystemTicks;
-      Corrected:=HWDiff / (SysDiff / DefaultSystemTicksPerSecond);
-      Result:=trunc(Corrected)
-    End
-  else result:=0
+  Result := EpikTimerBase.GetTimebaseCorrelation(FHWtickSupportAvailable, StartupCorrelationSample, UpdatedCorrelationSample);
 end;
 
 { If an accurate reference is available, update the TicksFrequency of the
   hardware timebase. }
 procedure TEpikTimer.CorrelateTimebases;
 begin
-  If MicrosecondSystemClockAvailable and HWTickSupportAvailable then
-    FHWTicks.TicksFrequency:=GetTimebaseCorrelation
+  EpikTimerBase.CorrelateTimebases(HWtickSupportAvailable, MicrosecondSystemClockAvailable, FHWTicks, StartupCorrelationSample, UpdatedCorrelationSample);
 end;
 
 (* * * * * * * * Initialization: Constructor and Destructor  * * * * * * *)
 
 constructor TEpikTimer.Create(AOwner: TComponent);
 
-  Procedure InitTimebases;
-  Begin
-
-    { Tick frequency rates are different for the system and HW timebases so we
-      need to store calibration data in the period format of each one. }
-    FSystemTicks.Ticks:=@SystemTicks; // Point to Ticks routine
-    With FSystemTicks.CalibrationParms do
-      Begin
-        FreqCalibrated:=False;
-        OverheadCalibrated:=False;
-        TicksIterations:=5;
-        SleepIterations:=10;
-        FrequencyGateTimeMS:=100;
-        FreqIterations:=1;
-      End;
-
-    // Initialize the HW tick source data
-    FHWCapabilityDataAvailable:=False;
-    FHWTickSupportAvailable:=False;
-    FHWTicks.Ticks:=@NullHardwareTicks; // returns a zero if no HW support
-    FHWTicks.TicksFrequency:=1;
-    With FHWTicks.CalibrationParms do
-      Begin
-        FreqCalibrated:=False;
-        OverheadCalibrated:=False;
-        TicksIterations:=10;
-        SleepIterations:=20;
-        FrequencyGateTimeMS:=150;
-        FreqIterations:=1;
-      End;
-
-    if HasHardwareCapabilityData then
-      Begin
-        FHWCapabilityDataAvailable:=True;
-        If HasHardwareTickCounter then
-          Begin
-            FHWTicks.Ticks:=@HardwareTicks;
-            FHWTickSupportAvailable:=CalibrateCallOverheads(FHWTicks)=0
-          End
-      end;
-         
-    CalibrateCallOverheads(FSystemTicks);
-    CalibrateTickFrequency(FSystemTicks);
-
-    // Overheads are set... get starting timestamps for long term calibration runs
-    GetCorrelationSample(StartupCorrelationSample);
-    With FSystemTicks do
-      If (TicksFrequency>(DefaultSystemTicksPerSecond-SystemTicksNormalRangeLimit)) and
-        (TicksFrequency<(DefaultSystemTicksPerSecond+SystemTicksNormalRangeLimit)) then
-        Begin // We've got a good microsecond system clock
-          FSystemTicks.TicksFrequency:=DefaultSystemTicksPerSecond; // assume it's pure
-          FMicrosecondSystemClockAvailable:=True;
-          If FHWTickSupportAvailable then
-            Begin
-              SystemSleep(FHWTicks.CalibrationParms.FrequencyGateTimeMS); // rough gate
-              CorrelateTimebases
-            End
-        end
-      else
-        Begin
-          FMicrosecondSystemClockAvailable:=False;
-          If FHWTickSupportAvailable then
-            CalibrateTickFrequency(FHWTicks) // sloppy but usable fallback calibration
-        End;
- End;
-
 begin
   inherited Create(AOwner);
   StringPrecision := 6;
   FWantMS         := True;
   FWantDays       := True;
-  InitTimebases;
+  EpikTimerBase.InitTimebases (FHWCapabilityDataAvailable,
+                               FHWTickSupportAvailable,
+                               FMicrosecondSystemClockAvailable,
+                               FSystemTicks,
+                               StartupCorrelationSample, UpdatedCorrelationSample);
+
   CorrelationMode := OnTimebaseSelect;
   // Default is the safe, cross-platform but less precise system timebase
   TimebaseSource  := SystemTimebase;
